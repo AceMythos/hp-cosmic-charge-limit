@@ -1,0 +1,14 @@
+[Unit]
+Description=HP Victus battery charge limiter (ACPI SBCO)
+After=multi-user.target
+ConditionPathExists=/proc/acpi/call
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hp-charge-limit daemon
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

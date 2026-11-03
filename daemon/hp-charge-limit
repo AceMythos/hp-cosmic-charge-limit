@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Battery charge limiter for HP Victus 15-fb3xxx (board 8DD0).
+
+Uses HP WMI command 0x2B through acpi_call:
+  GBCO (read, 0 args) -> Package{0, 4, Buffer{status, 0xff, ...}}
+  SBCO (write, 4 args) -> Package{0, code, Buffer{...}}
+
+Only two modes are ever written:
+  auto     SBCO 0x0 0x0 0x0 0x0   (stock behaviour)
+  inhibit  SBCO 0x0 0x5 0x0 0x0   (stop charging, GBCO then reads 0x04)
+
+Modes 2 (force-discharge), 6 and 7 (SHPM/STOE) are never used.
+
+The daemon listens on /run/hp-charge-limit.sock so an unprivileged GUI
+(COSMIC applet) can read status and toggle the limiter.
+"""
+
+import fcntl
+import grp
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+import time
+
+ACPI_CALL = "/proc/acpi/call"
+LOCK_PATH = "/run/hp-charge-limit.lock"
+SOCKET_PATH = "/run/hp-charge-limit.sock"
+CONF_PATH = "/etc/hp-charge-limit.conf"
+STATE_DIR = "/var/lib/hp-charge-limit"
+STATE_PATH = STATE_DIR + "/state.json"
+BATTERY = "/sys/class/power_supply/BAT0"
+AC_ADAPTER = "/sys/class/power_supply/ACAD"
+
+MODE_NAMES = {
+    0x00: "auto",
+    0x01: "charging",
+    0x02: "force-discharge",
+    0x03: "charge-policy",
+    0x04: "inhibit",
+    0x05: "inhibit(shpm)",
+    0x06: "inhibit(ext)",
+}
+
+ERROR_NAMES = {
+    0x03: "invalid argument",
+    0x34: "EC busy / unsupported",
+    0x35: "not allowed in current state",
+    0x36: "conflicting request",
+    0x37: "EC error",
+}
+
+CMD_AUTO = r"\_SB.WMID.SBCO 0x0 0x0 0x0 0x0"
+CMD_INHIBIT = r"\_SB.WMID.SBCO 0x0 0x5 0x0 0x0"
+CMD_READ = r"\_SB.WMID.GBCO"
+
+DEFAULTS = {"START": 75, "STOP": 80, "INTERVAL": 30, "ENABLED": True, "SOCKET_GROUP": ""}
+
+
+class FirmwareError(RuntimeError):
+    pass
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def read_text(path):
+    with open(path, "r") as handle:
+        return handle.read().strip()
+
+
+def read_int(path):
+    return int(read_text(path))
+
+
+def acpi(command):
+    """Run one acpi_call under an exclusive lock and return the reply text."""
+    with open(LOCK_PATH, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(ACPI_CALL, "w") as call:
+                call.write(command)
+            with open(ACPI_CALL, "r") as call:
+                return call.read().strip("\0 \t\r\n")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def reply_byte(reply):
+    """Pull the first buffer byte out of a reply like [0x0, 0x4, {0x00, 0xff, ..}]."""
+    match = re.search(r"\{([^}]*)\}", reply)
+    if not match:
+        raise FirmwareError("unexpected reply: %r" % reply)
+    first = match.group(1).split(",")[0].strip()
+    try:
+        return int(first, 16)
+    except ValueError:
+        raise FirmwareError("unexpected reply: %r" % reply)
+
+
+def read_mode():
+    return reply_byte(acpi(CMD_READ))
+
+
+def set_mode(mode):
+    command = CMD_INHIBIT if mode == "inhibit" else CMD_AUTO
+    code = reply_byte(acpi(command))
+    if code != 0:
+        raise FirmwareError(
+            "firmware refused %s: %s (0x%02x)"
+            % (mode, ERROR_NAMES.get(code, "unknown"), code)
+        )
+
+
+def load_config():
+    conf = dict(DEFAULTS)
+    if os.path.exists(CONF_PATH):
+        with open(CONF_PATH, "r") as handle:
+            for line in handle:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().upper()
+                value = value.strip()
+                if key not in conf:
+                    continue
+                if key == "SOCKET_GROUP":
+                    conf[key] = value
+                elif key == "ENABLED":
+                    conf[key] = value.lower() in ("1", "true", "yes", "on")
+                else:
+                    conf[key] = int(value)
+    validate(conf["START"], conf["STOP"], conf["INTERVAL"])
+    return conf
+
+
+def validate(start, stop, interval=None):
+    if not (0 <= int(start) < int(stop) <= 100):
+        raise SystemExit(
+            "bad config: need 0 <= START < STOP <= 100 (got %s/%s)" % (start, stop)
+        )
+    if interval is not None and int(interval) < 5:
+        raise SystemExit("bad config: INTERVAL must be >= 5 seconds")
+
+
+def load_state(conf):
+    state = {
+        "enabled": conf["ENABLED"],
+        "start": conf["START"],
+        "stop": conf["STOP"],
+    }
+    try:
+        with open(STATE_PATH, "r") as handle:
+            saved = json.load(handle)
+        state["enabled"] = bool(saved.get("enabled", state["enabled"]))
+        state["start"] = int(saved.get("start", state["start"]))
+        state["stop"] = int(saved.get("stop", state["stop"]))
+    except (OSError, ValueError):
+        pass
+    validate(state["start"], state["stop"])
+    return state
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    temp = STATE_PATH + ".tmp"
+    with open(temp, "w") as handle:
+        json.dump(state, handle)
+        handle.write("\n")
+    os.replace(temp, STATE_PATH)
+
+
+def read_status(state, interval):
+    try:
+        capacity = read_int(BATTERY + "/capacity")
+    except (OSError, ValueError):
+        capacity = None
+    try:
+        battery_status = read_text(BATTERY + "/status")
+    except OSError:
+        battery_status = "unknown"
+    try:
+        ac_online = read_text(AC_ADAPTER + "/online") == "1"
+    except OSError:
+        ac_online = False
+    try:
+        mode = read_mode()
+    except (FirmwareError, OSError):
+        mode = None
+    return {
+        "ok": True,
+        "capacity": capacity,
+        "status": battery_status,
+        "ac": ac_online,
+        "mode": mode,
+        "mode_name": MODE_NAMES.get(mode, "unknown") if mode is not None else "unavailable",
+        "enabled": state["enabled"],
+        "start": state["start"],
+        "stop": state["stop"],
+        "interval": interval,
+        "socket": SOCKET_PATH,
+    }
+
+
+class Daemon:
+    def __init__(self, conf):
+        self.conf = conf
+        self.state = load_state(conf)
+        self.interval = conf["INTERVAL"]
+        self.lock = threading.Lock()
+        self.stopping = False
+        self.server = None
+
+    # ---- policy -------------------------------------------------------
+
+    def tick(self):
+        with self.lock:
+            enabled = self.state["enabled"]
+            start = self.state["start"]
+            stop = self.state["stop"]
+
+        try:
+            capacity = read_int(BATTERY + "/capacity")
+            ac_online = read_text(AC_ADAPTER + "/online") == "1"
+        except (OSError, ValueError) as error:
+            log("read error: %s" % error)
+            return
+
+        if not enabled or not ac_online:
+            return
+        try:
+            mode = read_mode()
+            if capacity >= stop and mode != 0x04:
+                set_mode("inhibit")
+                log("cap=%d%% on AC -> inhibit" % capacity)
+            elif capacity <= start and mode == 0x04:
+                set_mode("auto")
+                log("cap=%d%% on AC -> auto (charging resumes)" % capacity)
+        except (FirmwareError, OSError) as error:
+            log("firmware error: %s" % error)
+
+    # ---- control socket -----------------------------------------------
+
+    def start_socket(self):
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(SOCKET_PATH)
+        server.listen(8)
+        server.settimeout(1.0)
+        self.server = server
+
+        group = self.conf.get("SOCKET_GROUP", "")
+        os.chmod(SOCKET_PATH, 0o660)
+        if group:
+            try:
+                gid = grp.getgrnam(group).gr_gid
+                os.chown(SOCKET_PATH, 0, gid)
+            except KeyError:
+                log("socket: group %r not found, leaving root:root" % group)
+        log("socket: %s" % SOCKET_PATH)
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while not self.stopping:
+            try:
+                connection, _ = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with connection:
+                try:
+                    connection.settimeout(5.0)
+                    raw = connection.makefile("rwb", buffering=0)
+                    request = json.loads(raw.readline().decode("utf-8", "replace"))
+                    reply = self.handle(request)
+                    raw.write((json.dumps(reply) + "\n").encode("utf-8"))
+                except (OSError, ValueError) as error:
+                    try:
+                        connection.sendall(json.dumps({"ok": False, "error": str(error)}).encode())
+                    except OSError:
+                        pass
+            time.sleep(0.01)
+
+    def handle(self, request):
+        command = request.get("cmd")
+        if command == "status":
+            return read_status(self.state, self.interval)
+
+        if command == "enable":
+            value = bool(request.get("value"))
+            with self.lock:
+                self.state["enabled"] = value
+                save_state(self.state)
+            if not value:
+                try:
+                    set_mode("auto")
+                except (FirmwareError, OSError) as error:
+                    log("disable: %s" % error)
+            log("limiter %s" % ("enabled" if value else "disabled"))
+            return read_status(self.state, self.interval)
+
+        if command == "set":
+            try:
+                start = int(request["start"])
+                stop = int(request["stop"])
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False, "error": "set needs integer start and stop"}
+            if not (0 <= start < stop <= 100):
+                return {"ok": False, "error": "need 0 <= start < stop <= 100"}
+            with self.lock:
+                self.state["start"] = start
+                self.state["stop"] = stop
+                save_state(self.state)
+            log("thresholds: stop=%d%% start=%d%%" % (stop, start))
+            return read_status(self.state, self.interval)
+
+        return {"ok": False, "error": "unknown command: %r" % command}
+
+    # ---- lifecycle -----------------------------------------------------
+
+    def run(self):
+        def request_stop(signum, frame):
+            self.stopping = True
+
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+
+        self.start_socket()
+        log(
+            "started: enabled=%s stop=%d%% start=%d%% interval=%ds"
+            % (self.state["enabled"], self.state["stop"], self.state["start"], self.interval)
+        )
+        try:
+            while not self.stopping:
+                self.tick()
+                waited = 0
+                while waited < self.interval and not self.stopping:
+                    time.sleep(1)
+                    waited += 1
+        finally:
+            try:
+                set_mode("auto")
+                log("stopped: charging restored to auto")
+            except Exception as error:
+                log("stopped: FAILED to restore auto: %s" % error)
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
+
+
+def cmd_status():
+    state = load_state(load_config())
+    info = read_status(state, load_config()["INTERVAL"])
+    print("battery: %s%% (%s)" % (info["capacity"], info["status"]))
+    print("AC: %s" % ("online" if info["ac"] else "offline"))
+    print("firmware: %s (0x%02x)" % (info["mode_name"], info["mode"] or 0))
+    print("limiter: %s" % ("on" if info["enabled"] else "off"))
+    print("band: stop %d%% / start %d%%" % (info["stop"], info["start"]))
+    print("socket: %s" % info["socket"])
+
+
+def cmd_set_state(enabled=None, start=None, stop=None):
+    if os.geteuid() != 0:
+        raise SystemExit("set needs root")
+    conf = load_config()
+    state = load_state(conf)
+    if enabled is not None:
+        state["enabled"] = enabled
+    if start is not None:
+        state["start"] = start
+    if stop is not None:
+        state["stop"] = stop
+    validate(state["start"], state["stop"])
+    save_state(state)
+    if enabled is False:
+        set_mode("auto")
+    print("limiter: %s, stop %d%% / start %d%%" % ("on" if state["enabled"] else "off", state["stop"], state["start"]))
+
+
+def cmd_socket(request):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    client.connect(SOCKET_PATH)
+    client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+    reply = b""
+    while not reply.endswith(b"\n"):
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        reply += chunk
+    client.close()
+    print(reply.decode("utf-8", "replace").strip())
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "status"
+    if command == "daemon":
+        if os.geteuid() != 0:
+            raise SystemExit("daemon needs root")
+        Daemon(load_config()).run()
+    elif command == "status":
+        cmd_status()
+    elif command == "enable":
+        cmd_set_state(enabled=True)
+    elif command == "disable":
+        cmd_set_state(enabled=False)
+    elif command == "set" and len(argv) == 4:
+        cmd_set_state(start=int(argv[2]), stop=int(argv[3]))
+    elif command == "api" and len(argv) == 3:
+        cmd_socket(json.loads(argv[2]))
+    else:
+        raise SystemExit(
+            "usage: hp-charge-limit [status | daemon | enable | disable | "
+            "set START STOP | api JSON]"
+        )
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Charge Limit
+Comment=Stop battery charging at a chosen percentage (HP)
+Type=Application
+Exec=hp-cosmic-charge-limit
+Terminal=false
+Categories=Utility;X-COSMIC;
+Keywords=COSMIC;Battery;Charge;Limit;HP;Victus;
+Icon=io.github.AceMythos.HpCosmicChargeLimit-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-OverflowPriority=10

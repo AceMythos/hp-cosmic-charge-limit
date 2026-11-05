@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::window;
+use cosmic::iced::mouse;
+use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::time;
 use cosmic::iced::window::Id;
-use cosmic::iced::{Length, Limits, Rectangle, Subscription};
-use cosmic::surface::action::{app_popup, destroy_popup};
-use cosmic::widget::{column, divider, list_column, row, settings, slider, text, toggler};
-use cosmic::Element;
+use cosmic::iced::{Alignment, Color, Length, Limits, Rectangle, Subscription};
+use cosmic::widget::{button, canvas, column, divider, row, settings, slider, space, text, toggler};
+use cosmic::{Element, Theme};
 
 use crate::socket::{self, Status};
 
@@ -23,7 +24,7 @@ pub struct App {
     popup: Option<Id>,
     status: Option<Status>,
     error: Option<String>,
-    /// True while a slider is being dragged so the 2 s poll cannot move it.
+    /// True while a slider is being dragged so the poll cannot move it.
     editing: bool,
 }
 
@@ -41,7 +42,7 @@ impl Default for App {
 
 #[derive(Clone, Debug)]
 pub enum Message {
-    Surface(cosmic::surface::Action<Message>),
+    TogglePopup,
     PopupClosed(Id),
     Refresh,
     Loaded(Result<Status, String>),
@@ -79,8 +80,28 @@ impl cosmic::Application for App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Surface(action) => {
-                return cosmic::task::message(cosmic::Action::Surface(action));
+            Message::TogglePopup => {
+                return if let Some(popup_id) = self.popup.take() {
+                    destroy_popup(popup_id)
+                } else {
+                    let new_id = Id::unique();
+                    self.popup = Some(new_id);
+
+                    let mut popup_settings = self.core.applet.get_popup_settings(
+                        self.core.main_window_id().unwrap(),
+                        new_id,
+                        None,
+                        None,
+                        None,
+                    );
+                    popup_settings.positioner.size_limits = Limits::NONE
+                        .max_width(400.0)
+                        .min_width(360.0)
+                        .min_height(320.0)
+                        .max_height(800.0);
+
+                    Task::batch([get_popup(popup_settings), fetch()])
+                };
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
@@ -101,7 +122,7 @@ impl cosmic::Application for App {
                     self.error = None;
                 }
                 Err(error) => {
-                    self.status = None;
+                    // A single failed poll should not blank a working popup.
                     self.error = Some(error);
                 }
             },
@@ -110,9 +131,8 @@ impl cosmic::Application for App {
             }
             Message::StopChanged(value) => {
                 if let Some(status) = &mut self.status {
-                    status.stop = (value.round() as u32)
-                        .min(100)
-                        .max(status.start.saturating_add(1));
+                    let lowest = (status.start + 1).min(100);
+                    status.stop = (value.round() as u32).min(100).max(lowest);
                     self.editing = true;
                 }
             }
@@ -137,72 +157,25 @@ impl cosmic::Application for App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let have_popup = self.popup;
-        let btn = self
-            .core
-            .applet
-            .icon_button(if self.status.as_ref().is_some_and(|status| status.enabled) {
-                "battery-level-80-symbolic"
-            } else {
-                "battery-level-100-symbolic"
-            })
-            .on_press_with_rectangle(move |offset, bounds| {
-                if let Some(id) = have_popup {
-                    Message::Surface(destroy_popup(id))
-                } else {
-                    Message::Surface(app_popup::<App>(
-                        |_| Default::default(),
-                        move |state: &mut App| {
-                            let new_id = Id::unique();
-                            state.popup = Some(new_id);
-                            let mut popup_settings = state.core.applet.get_popup_settings(
-                                state.core.main_window_id().unwrap(),
-                                new_id,
-                                None,
-                                None,
-                                None,
-                            );
-                            popup_settings.positioner.anchor_rect = Rectangle {
-                                x: (bounds.x - offset.x) as i32,
-                                y: (bounds.y - offset.y) as i32,
-                                width: bounds.width as i32,
-                                height: bounds.height as i32,
-                            };
-                            popup_settings.positioner.size_limits = Limits::NONE
-                                .max_width(400.0)
-                                .min_width(320.0)
-                                .min_height(240.0)
-                                .max_height(800.0);
-                            popup_settings
-                        },
-                        Some(Box::new(|state: &App| {
-                            Element::from(state.core.applet.popup_container(state.popup_body()))
-                                .map(cosmic::Action::App)
-                        })),
-                    ))
-                }
-            });
-
-        let tooltip = match &self.status {
-            Some(status) => format!(
-                "{}% · limit {} · {}",
-                status
-                    .capacity
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "--".into()),
-                if status.enabled { "on" } else { "off" },
-                status.mode_name
-            ),
-            None => "Charge limiter daemon not reachable".to_string(),
+        let active = self.status.as_ref().is_some_and(|status| status.enabled);
+        let label = match &self.status {
+            Some(status) if status.enabled => format!("{}%", status.stop),
+            Some(_) => "off".to_string(),
+            None => "—".to_string(),
         };
 
-        Element::from(self.core.applet.applet_tooltip::<Message>(
-            btn,
-            tooltip,
-            self.popup.is_some(),
-            |action| Message::Surface(action),
-            None,
-        ))
+        let glyph = canvas::Canvas::<LimitGlyph, Message, Theme>::new(LimitGlyph { active })
+            .width(Length::Fixed(22.0))
+            .height(Length::Fixed(16.0));
+
+        let content = row![glyph, text::body(label)].spacing(6).align_y(Alignment::Center);
+
+        let btn = button::custom(content)
+            .class(cosmic::theme::Button::AppletIcon)
+            .on_press_down(Message::TogglePopup)
+            .padding([4, 8]);
+
+        self.core.applet.autosize_window(btn).into()
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
@@ -221,81 +194,134 @@ impl cosmic::Application for App {
 impl App {
     fn popup_body(&self) -> Element<'_, Message> {
         let Some(status) = &self.status else {
-            let mut body = list_column().list_item_padding(8);
-            body = body.add(text::title4("Charge limit"));
-            body = body.add(text("Daemon not reachable."));
+            let mut body = column![
+                text::title4("Charge limit"),
+                text("The daemon is not running."),
+            ]
+            .spacing(8);
+
             if let Some(error) = &self.error {
-                body = body.add(text(error.clone()));
+                body = body.push(text::caption(error.clone()));
             }
-            body = body.add(divider::horizontal::default());
-            body = body.add(text("Start it with:"));
-            body = body.add(text("sudo systemctl start hp-charge-limit"));
-            return column![body].width(Length::Fill).into();
+
+            body = body.push(button::standard("Retry").on_press(Message::Refresh));
+            body = body.push(text::caption("sudo systemctl start hp-charge-limit"));
+
+            return column![body].padding(16).width(Length::Fill).into();
         };
 
         let capacity = status
             .capacity
             .map(|c| format!("{c}%"))
-            .unwrap_or_else(|| "--".into());
+            .unwrap_or_else(|| "—".into());
+        let mode_label = match status.mode {
+            Some(0) => "auto".to_string(),
+            Some(4) => "inhibit".to_string(),
+            Some(mode) => format!("0x{mode:02x}"),
+            None => "unavailable".to_string(),
+        };
+
+        let theme = cosmic::theme::active();
+        let accent: Color = theme.cosmic().accent_color().into();
+        let on_bg: Color = theme.cosmic().on_bg_color().into();
+        let muted_color = Color::from_rgba(on_bg.r, on_bg.g, on_bg.b, 0.55);
+
+        let state_text = if status.enabled { "Limiting" } else { "Off" };
+        let state_color = if status.enabled { accent } else { muted_color };
+
+        let header_glyph =
+            canvas::Canvas::<LimitGlyph, Message, Theme>::new(LimitGlyph { active: status.enabled })
+                .width(Length::Fixed(34.0))
+                .height(Length::Fixed(26.0));
 
         let header = row![
-            column![text(capacity).size(28), text(status.status.clone())].spacing(2),
+            header_glyph,
             column![
-                text(if status.ac { "AC online" } else { "On battery" }),
-                text(format!("firmware: {}", status.mode_name)),
+                text(capacity).size(30),
+                text::caption(format!(
+                    "{} · {}",
+                    status.status,
+                    if status.ac { "AC online" } else { "on battery" }
+                )),
             ]
-            .spacing(2),
+            .spacing(0)
+            .width(Length::Fill),
+            column![
+                text(state_text).size(14).class(cosmic::theme::Text::Color(state_color)),
+                text::caption(format!("{}-{}%", status.start, status.stop)),
+            ]
+            .spacing(1)
+            .align_x(Alignment::End),
         ]
-        .spacing(16)
-        .align_y(cosmic::iced::Alignment::Center);
+        .spacing(10)
+        .align_y(Alignment::Center);
 
-        let mut body = list_column().list_item_padding(8);
-        body = body.add(header);
-        body = body.add(divider::horizontal::default());
+        let band = canvas::Canvas::<ChargeBand, Message, Theme>::new(ChargeBand {
+            charge: status.capacity.map(|c| c as f32),
+            start: status.start as f32,
+            stop: status.stop as f32,
+            active: status.enabled,
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(18.0));
 
-        body = body.add(settings::item(
-            "Charge limit",
-            toggler(status.enabled).on_toggle(Message::ToggleLimit),
+        let band_caption = text::caption(format!(
+            "resumes at {}% · stops at {}%",
+            status.start, status.stop
         ));
 
         let stop_min = (status.start + 1).min(100) as f64;
         let stop_value = (status.stop as f64).clamp(stop_min, 100.0);
-        body = body.add(settings::item(
-            "Stop at",
-            text(format!("{}%", status.stop)),
-        ));
-        body = body.add(
+        let stop_row = row![
+            text("Stop charging at"),
+            space::horizontal(),
+            text(format!("{}%", status.stop)).size(16),
+        ]
+        .align_y(Alignment::Center);
+
+        let start_max = status.stop.saturating_sub(1) as f64;
+        let start_value = (status.start as f64).clamp(0.0, start_max.max(0.0));
+        let start_row = row![
+            text("Resume charging at"),
+            space::horizontal(),
+            text(format!("{}%", status.start)).size(16),
+        ]
+        .align_y(Alignment::Center);
+
+        let mut body = column![
+            header,
+            band,
+            band_caption,
+            divider::horizontal::default(),
+            settings::item(
+                "Charge limit",
+                toggler(status.enabled).on_toggle(Message::ToggleLimit),
+            ),
+            divider::horizontal::default(),
+            stop_row,
             slider(stop_min..=100.0, stop_value, Message::StopChanged)
                 .step(1.0)
                 .width(Length::Fill)
                 .on_release(Message::Persist),
-        );
-
-        let start_max = status.stop.saturating_sub(1) as f64;
-        let start_value = (status.start as f64).clamp(0.0, start_max.max(0.0));
-        body = body.add(settings::item(
-            "Resume at",
-            text(format!("{}%", status.start)),
-        ));
-        body = body.add(
+            start_row,
             slider(0.0..=start_max.max(0.0), start_value, Message::StartChanged)
                 .step(1.0)
                 .width(Length::Fill)
                 .on_release(Message::Persist),
-        );
-
-        body = body.add(divider::horizontal::default());
-        body = body.add(settings::item("Firmware", text(status.mode_name.clone())));
-        body = body.add(settings::item(
-            "Poll every",
-            text(format!("{} s", status.interval)),
-        ));
+            divider::horizontal::default(),
+            text::caption(format!(
+                "firmware {} · polled every {} s",
+                mode_label, status.interval
+            )),
+        ]
+        .spacing(10)
+        .padding(16);
 
         if let Some(error) = &self.error {
-            body = body.add(settings::item("Error", text(error.clone())));
+            body = body.push(text::caption(error.clone()).class(cosmic::theme::Text::Color(muted_color)));
         }
 
-        column![body].width(Length::Fill).into()
+        body.width(Length::Fill).into()
     }
 }
 
@@ -319,4 +345,149 @@ fn send(request: String) -> Task<Message> {
         },
         |result| cosmic::Action::App(Message::Loaded(result)),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Custom glyph: a lightning bolt under a ceiling bar. No battery outline.
+// ---------------------------------------------------------------------------
+
+struct LimitGlyph {
+    active: bool,
+}
+
+impl canvas::Program<Message, Theme> for LimitGlyph {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &cosmic::iced::Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+
+        let w = bounds.width;
+        let h = bounds.height;
+        let accent: Color = theme.cosmic().accent_color().into();
+        let on: Color = theme.cosmic().on_bg_color().into();
+        let muted = Color::from_rgba(on.r, on.g, on.b, 0.40);
+
+        let cap_height = (h * 0.13).clamp(1.5, 3.0);
+        let cap = canvas::Path::new(|builder| {
+            builder.rounded_rectangle(
+                cosmic::iced::Point::new(w * 0.10, 0.0),
+                cosmic::iced::Size::new(w * 0.80, cap_height),
+                cosmic::iced::border::Radius::from(cap_height / 2.0),
+            )
+        });
+        frame.fill(&cap, if self.active { accent } else { muted });
+
+        let bolt = canvas::Path::new(|builder| {
+            builder.move_to(cosmic::iced::Point::new(w * 0.58, h * 0.24));
+            builder.line_to(cosmic::iced::Point::new(w * 0.28, h * 0.60));
+            builder.line_to(cosmic::iced::Point::new(w * 0.47, h * 0.60));
+            builder.line_to(cosmic::iced::Point::new(w * 0.40, h * 0.94));
+            builder.line_to(cosmic::iced::Point::new(w * 0.73, h * 0.52));
+            builder.line_to(cosmic::iced::Point::new(w * 0.54, h * 0.52));
+            builder.close();
+        });
+        frame.fill(&bolt, if self.active { on } else { muted });
+
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Charge band: current charge plus the resume -> stop window.
+// ---------------------------------------------------------------------------
+
+struct ChargeBand {
+    charge: Option<f32>,
+    start: f32,
+    stop: f32,
+    active: bool,
+}
+
+impl canvas::Program<Message, Theme> for ChargeBand {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &cosmic::iced::Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+
+        let w = bounds.width;
+        let track_h = 12.0;
+        let y = (bounds.height - track_h) / 2.0;
+        let radius = track_h / 2.0;
+
+        let accent: Color = theme.cosmic().accent_color().into();
+        let on: Color = theme.cosmic().on_bg_color().into();
+        let track_color = Color::from_rgba(on.r, on.g, on.b, 0.16);
+
+        let track = canvas::Path::new(|builder| {
+            builder.rounded_rectangle(
+                cosmic::iced::Point::new(0.0, y),
+                cosmic::iced::Size::new(w, track_h),
+                cosmic::iced::border::Radius::from(radius),
+            )
+        });
+        frame.fill(&track, track_color);
+
+        let start = (self.start / 100.0).clamp(0.0, 1.0);
+        let stop = (self.stop / 100.0).clamp(0.0, 1.0);
+        let (lo, hi) = if start <= stop {
+            (start, stop)
+        } else {
+            (stop, start)
+        };
+
+        let zone_x = w * lo;
+        let zone_w = (w * (hi - lo)).max(1.0);
+        let zone_color = if self.active {
+            Color::from_rgba(accent.r, accent.g, accent.b, 0.50)
+        } else {
+            Color::from_rgba(on.r, on.g, on.b, 0.20)
+        };
+        let zone_edge = if self.active {
+            Color::from_rgba(accent.r, accent.g, accent.b, 0.95)
+        } else {
+            Color::from_rgba(on.r, on.g, on.b, 0.45)
+        };
+        let zone = canvas::Path::new(|builder| {
+            builder.rounded_rectangle(
+                cosmic::iced::Point::new(zone_x, y),
+                cosmic::iced::Size::new(zone_w, track_h),
+                cosmic::iced::border::Radius::from(radius.min(zone_w / 2.0)),
+            )
+        });
+        frame.fill(&zone, zone_color);
+        frame.stroke(
+            &zone,
+            canvas::Stroke::default()
+                .with_width(1.0)
+                .with_color(zone_edge),
+        );
+
+        if let Some(charge) = self.charge {
+            let marker_x = (w * (charge / 100.0).clamp(0.0, 1.0)).clamp(2.0, w - 2.0);
+            let marker = canvas::Path::new(|builder| {
+                builder.rounded_rectangle(
+                    cosmic::iced::Point::new(marker_x - 1.5, y - 3.0),
+                    cosmic::iced::Size::new(3.0, track_h + 6.0),
+                    cosmic::iced::border::Radius::from(1.5),
+                )
+            });
+            frame.fill(&marker, if self.active { on } else { accent });
+        }
+
+        vec![frame.into_geometry()]
+    }
 }

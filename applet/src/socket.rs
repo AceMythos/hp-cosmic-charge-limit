@@ -13,7 +13,7 @@ pub struct Status {
     pub capacity: Option<u32>,
     pub status: String,
     pub ac: bool,
-    pub mode_name: String,
+    pub mode: Option<u32>,
     pub enabled: bool,
     pub start: u32,
     pub stop: u32,

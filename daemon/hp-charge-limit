@@ -35,14 +35,16 @@ STATE_PATH = STATE_DIR + "/state.json"
 BATTERY = "/sys/class/power_supply/BAT0"
 AC_ADAPTER = "/sys/class/power_supply/ACAD"
 
+# GBCO read values. These are not the same as the SBCO write modes.
 MODE_NAMES = {
     0x00: "auto",
     0x01: "charging",
-    0x02: "force-discharge",
-    0x03: "charge-policy",
+    0x02: "on-battery",
+    0x03: "low-current",
     0x04: "inhibit",
     0x05: "inhibit(shpm)",
     0x06: "inhibit(ext)",
+    0xFF: "unavailable",
 }
 
 ERROR_NAMES = {

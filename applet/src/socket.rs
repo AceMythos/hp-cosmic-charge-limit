@@ -14,6 +14,8 @@ pub struct Status {
     pub status: String,
     pub ac: bool,
     pub mode: Option<u32>,
+    #[serde(default)]
+    pub mode_name: Option<String>,
     pub enabled: bool,
     pub start: u32,
     pub stop: u32,

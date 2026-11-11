@@ -200,7 +200,7 @@ ls -l /run/hp-charge-limit.sock
 ```
 
 - **The applet says "daemon not reachable".** The service is not running, or your user is not in `SOCKET_GROUP`.
-- **`/proc/acpi/call` is missing.** `acpi_call` is not loaded, or DKMS failed.
+- **`/proc/acpi/call` is missing after a kernel update.** `acpi_call` is a DKMS module, so it must be built for each kernel, and that needs the matching `linux-headers` package. A newer kernel can boot before its headers are installed, and then the module is never built until you install them.
 - **The firmware refuses the write.** The reply contains an HP error code (`0x34` EC busy, `0x35` not allowed, `0x36` conflict, `0x37` EC error). The daemon logs the code.
 - **The battery status says Charging or Full while `GBCO` reports inhibit.** Some firmware does this. The `GBCO` mode is the source of truth.
 
